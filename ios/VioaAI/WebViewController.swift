@@ -1,5 +1,6 @@
 import UIKit
 import WebKit
+import AuthenticationServices
 
 /// The app's single screen: a full-screen WKWebView pointed at vioa.site.
 ///
@@ -20,9 +21,55 @@ final class WebViewController: UIViewController {
     private static let versionURL = URL(string: "https://vioa.site/downloads/app-version.json")!
     private static let ownHost = "vioa.site"
     private static let appVersion =
-        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0.5"
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0.6"
 
     private let background = UIColor(red: 10 / 255, green: 10 / 255, blue: 10 / 255, alpha: 1)
+    private var authSession: ASWebAuthenticationSession?
+    private var webViewBottom: NSLayoutConstraint?
+
+    /// A real Safari identity plus an app marker, so the site can render the
+    /// native chrome while Google still recognises the browser.
+    private static var userAgent: String {
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) "
+        + "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+        + "Version/18.6 Mobile/15E148 Safari/604.1 VioaAI/\(appVersion)"
+    }
+
+    /// Runs before the first paint: marks the page as the native app, exposes the
+    /// bridge object, and installs the iOS-style surface (the detailed look lives
+    /// in the site's stylesheet under `html.vioa-app`).
+    private static let appChromeScript: String = {
+        let css = """
+        html.vioa-app{background:#0b0b0f;-webkit-text-size-adjust:100%;text-size-adjust:100%}
+        html.vioa-app ::-webkit-scrollbar{width:0;height:0;display:none}
+        html.vioa-app body{-webkit-font-smoothing:antialiased;-webkit-tap-highlight-color:transparent;overscroll-behavior-y:none}
+        html.vioa-app input,html.vioa-app textarea,html.vioa-app select{font-size:16px}
+        html.vioa-app .ios-sheet{display:none!important}
+        """
+        return """
+        (function(){
+          var css = `\(css)`;
+          window.vioaNative = { platform: 'ios', version: '\(appVersion)', googleAuth: true };
+          window.__vioaKb = function (h) {
+            document.documentElement.style.setProperty('--vioa-kb', (h > 0 ? h : 0) + 'px');
+            return true;
+          };
+          function paint() {
+            var root = document.documentElement;
+            if (!root) { setTimeout(paint, 8); return; }
+            root.classList.add('vioa-app');
+            if (!document.getElementById('vioa-app-css')) {
+              var s = document.createElement('style');
+              s.id = 'vioa-app-css';
+              s.appendChild(document.createTextNode(css));
+              (document.head || root).appendChild(s);
+            }
+          }
+          paint();
+          document.addEventListener('DOMContentLoaded', paint);
+        })();
+        """
+    }()
 
     // MARK: - Views
 
@@ -53,15 +100,25 @@ final class WebViewController: UIViewController {
 
     override func viewDidLoad() {
         super.viewDidLoad()
+        view.backgroundColor = background
         configureWebView()
         configureChrome()
         configureErrorPanel()
-        loadHome()
+        observeKeyboard()
+        observeAuth()
+        if let code = AppDelegate.pendingAuthCode {
+            AppDelegate.pendingAuthCode = nil
+            finishNativeSignIn(code: code)
+        } else {
+            loadHome()
+        }
         checkForUpdates()
     }
 
     deinit {
         progressObservation?.invalidate()
+        NotificationCenter.default.removeObserver(self)
+        webView?.configuration.userContentController.removeScriptMessageHandler(forName: "vioaAuth")
     }
 
     override var preferredStatusBarStyle: UIStatusBarStyle { .lightContent }
@@ -70,27 +127,54 @@ final class WebViewController: UIViewController {
 
     private func configureWebView() {
         let configuration = WKWebViewConfiguration()
+        // Same store as Safari-style persistence: cookies and localStorage survive relaunches.
         configuration.websiteDataStore = .default()
-        configuration.defaultWebpagePreferences.allowsContentJavaScript = true
+        configuration.allowsAirPlayForMediaPlayback = true
+        configuration.suppressesIncrementalRendering = false
         configuration.allowsInlineMediaPlayback = true
         configuration.mediaTypesRequiringUserActionForPlayback = []
         configuration.preferences.javaScriptCanOpenWindowsAutomatically = true
-        // Google treats a bare WebKit UA better when the app identifies itself.
-        configuration.applicationNameForUserAgent = "VioaAI/\(Self.appVersion)"
+        if #available(iOS 14.0, *) {
+            configuration.defaultWebpagePreferences.allowsContentJavaScript = true
+        }
+        if #available(iOS 14.5, *) {
+            configuration.defaultWebpagePreferences.preferredContentMode = .mobile
+        }
+
+        // Native auth bridge: the web app asks us to run Google sign-in in a real
+        // browser session (Google blocks OAuth inside embedded web views).
+        configuration.userContentController.add(self, name: "vioaAuth")
+
+        // Paint the native look before the first frame so there is no flash.
+        configuration.userContentController.addUserScript(
+            WKUserScript(
+                source: Self.appChromeScript,
+                injectionTime: .atDocumentStart,
+                forMainFrameOnly: false
+            )
+        )
 
         webView = WKWebView(frame: .zero, configuration: configuration)
+        webView.customUserAgent = Self.userAgent
         webView.navigationDelegate = self
         webView.uiDelegate = self
         webView.allowsBackForwardNavigationGestures = true
+        webView.allowsLinkPreview = true
         webView.isOpaque = false
         webView.backgroundColor = background
         webView.scrollView.backgroundColor = background
+        webView.scrollView.keyboardDismissMode = .interactive
+        webView.scrollView.contentInsetAdjustmentBehavior = .never
         webView.translatesAutoresizingMaskIntoConstraints = false
+
         view.addSubview(webView)
+
+        let bottom = webView.bottomAnchor.constraint(equalTo: view.bottomAnchor)
+        webViewBottom = bottom
 
         NSLayoutConstraint.activate([
             webView.topAnchor.constraint(equalTo: view.topAnchor),
-            webView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            bottom,
             webView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             webView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
         ])
@@ -153,6 +237,10 @@ final class WebViewController: UIViewController {
         retryButton.titleLabel?.font = .systemFont(ofSize: 15, weight: .semibold)
         retryButton.contentEdgeInsets = UIEdgeInsets(top: 11, left: 22, bottom: 11, right: 22)
         retryButton.layer.cornerRadius = 12
+        if #available(iOS 13.0, *) {
+            retryButton.layer.cornerCurve = .continuous
+        }
+        retryButton.layer.masksToBounds = true
         retryButton.addTarget(self, action: #selector(retryTapped), for: .touchUpInside)
 
         stack.addArrangedSubview(title)
@@ -206,14 +294,15 @@ final class WebViewController: UIViewController {
                 let self = self,
                 let data = data,
                 let object = try? JSONSerialization.jsonObject(with: data),
-                let dictionary = object as? [String: Any],
-                let latest = dictionary["version"] as? String,
-                self.isNewer(latest, than: Self.appVersion)
+                let dictionary = object as? [String: Any]
             else { return }
 
-            if UserDefaults.standard.string(forKey: "vioa.dismissedUpdate") == latest { return }
+            let latest = (dictionary["iosVersion"] as? String) ?? (dictionary["version"] as? String)
+            guard let latestVersion = latest, self.isNewer(latestVersion, than: Self.appVersion) else { return }
+
+            if UserDefaults.standard.string(forKey: "vioa.dismissedUpdate") == latestVersion { return }
             DispatchQueue.main.async {
-                self.showUpdatePill(version: latest)
+                self.showUpdatePill(version: latestVersion)
             }
         }.resume()
     }
@@ -275,6 +364,13 @@ final class WebViewController: UIViewController {
         return scheme == "https" && isOwnHost(url.host)
     }
 
+    /// Google's sign-in hosts may load inside the app so the popup window can
+    /// complete there instead of bouncing the user into Safari.
+    private func isAuthHost(_ host: String?) -> Bool {
+        guard let host = host?.lowercased() else { return false }
+        return ["accounts.google.com", "accounts.google.co.uk", "accounts.youtube.com"].contains(host)
+    }
+
     private func openExternally(_ url: URL) {
         let scheme = url.scheme?.lowercased() ?? ""
         guard ["http", "https", "mailto", "tel", "sms"].contains(scheme) else { return }
@@ -285,6 +381,129 @@ final class WebViewController: UIViewController {
         errorLabel.text = message
         errorPanel.isHidden = false
         progressBar.isHidden = true
+    }
+
+    // MARK: - Keyboard
+
+    private func observeAuth() {
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(nativeAuthCode(_:)),
+            name: AppDelegate.authCodeNotification,
+            object: nil
+        )
+    }
+
+    @objc private func nativeAuthCode(_ note: Notification) {
+        if let code = note.object as? String {
+            finishNativeSignIn(code: code)
+        }
+    }
+
+    private func observeKeyboard() {
+        let center = NotificationCenter.default
+        center.addObserver(self, selector: #selector(keyboardWillChange(_:)),
+                           name: UIResponder.keyboardWillChangeFrameNotification, object: nil)
+        center.addObserver(self, selector: #selector(keyboardWillHide(_:)),
+                           name: UIResponder.keyboardWillHideNotification, object: nil)
+    }
+
+    @objc private func keyboardWillChange(_ note: Notification) {
+        guard let frame = (note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? NSValue)?.cgRectValue else { return }
+        let overlap = max(0, view.bounds.maxY - view.convert(frame, from: nil).minY)
+        let duration = (note.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? Double) ?? 0.25
+        applyKeyboard(overlap, duration: duration)
+    }
+
+    @objc private func keyboardWillHide(_ note: Notification) {
+        let duration = (note.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? Double) ?? 0.25
+        applyKeyboard(0, duration: duration)
+    }
+
+    private func applyKeyboard(_ overlap: CGFloat, duration: Double) {
+        UIView.animate(withDuration: duration, delay: 0, options: [.curveEaseOut]) {
+            self.webViewBottom?.constant = -overlap
+            self.view.layoutIfNeeded()
+        }
+    }
+
+    // MARK: - Google sign-in (real browser session)
+
+    private func startGoogleSignIn() {
+        guard let url = URL(string: "https://vioa.site/auth/native?app=ios") else { return }
+        authSession?.cancel()
+
+        let session = ASWebAuthenticationSession(url: url, callbackURLScheme: "vioaai") { [weak self] callback, error in
+            guard let self = self else { return }
+            defer { self.authSession = nil }
+            if let error = error {
+                let cancelled = (error as? ASWebAuthenticationSessionError)?.code == .canceledLogin
+                if !cancelled {
+                    self.toast("تعذّر تسجيل الدخول · Sign-in failed")
+                }
+                return
+            }
+            guard let callback = callback,
+                  let comps = URLComponents(url: callback, resolvingAgainstBaseURL: false)
+            else {
+                self.toast("تعذّر تسجيل الدخول · Sign-in failed")
+                return
+            }
+            if comps.queryItems?.first(where: { $0.name == "error" })?.value == "email" {
+                self.focusEmailLogin()
+                return
+            }
+            guard let code = comps.queryItems?.first(where: { $0.name == "code" })?.value else {
+                self.toast("تعذّر تسجيل الدخول · Sign-in failed")
+                return
+            }
+            self.finishNativeSignIn(code: code)
+        }
+        session.presentationContextProvider = self
+        session.prefersEphemeralWebBrowserSession = false
+        authSession = session
+        if !session.start() {
+            authSession = nil
+            toast("تعذّر فتح المتصفح · Could not open the browser")
+        }
+    }
+
+    private func finishNativeSignIn(code: String) {
+        var comps = URLComponents(string: "https://vioa.site/auth/native/land")
+        comps?.queryItems = [
+            URLQueryItem(name: "code", value: code),
+            URLQueryItem(name: "app", value: "ios"),
+        ]
+        if let url = comps?.url {
+            webView.load(URLRequest(url: url))
+        }
+    }
+
+    private func toast(_ text: String) {
+        let alert = UIAlertController(title: nil, message: text, preferredStyle: .alert)
+        present(alert, animated: true)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) {
+            alert.dismiss(animated: true)
+        }
+    }
+
+    /// The user asked to finish signing in with email instead of Google.
+    private func focusEmailLogin() {
+        let js = """
+        (function(){
+          var email = document.getElementById('authEmail');
+          var screen = document.getElementById('authScreen');
+          if (screen) screen.classList.remove('hidden');
+          if (email) {
+            email.focus();
+            if (email.scrollIntoView) email.scrollIntoView({ block: 'center', behavior: 'smooth' });
+          }
+          var err = document.getElementById('authError');
+          if (err) err.textContent = '';
+          return true;
+        })();
+        """
+        webView.evaluateJavaScript(js, completionHandler: nil)
     }
 
     private func presentDownloadedFile(_ url: URL) {
@@ -328,7 +547,7 @@ extension WebViewController: WKNavigationDelegate {
             return
         }
 
-        if isInternal(url) {
+        if isInternal(url) || isAuthHost(url.host) {
             decisionHandler(.allow)
             return
         }
@@ -374,6 +593,10 @@ extension WebViewController: WKNavigationDelegate {
     }
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        errorPanel.isHidden = true
+    }
+
+    func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
         errorPanel.isHidden = true
     }
 
@@ -505,6 +728,43 @@ extension WebViewController: WKUIDelegate {
         } else {
             decisionHandler(.deny)
         }
+    }
+
+    // MARK: - iOS 27 surface is installed by `appChromeScript` at document start.
+}
+
+// MARK: - Native bridge (web → app)
+
+extension WebViewController: WKScriptMessageHandler {
+
+    func userContentController(
+        _ userContentController: WKUserContentController,
+        didReceive message: WKScriptMessage
+    ) {
+        guard message.name == "vioaAuth" else { return }
+        var action = ""
+        if let text = message.body as? String {
+            action = text
+        } else if let body = message.body as? [String: Any] {
+            action = (body["action"] as? String) ?? ""
+        }
+        switch action {
+        case "google":
+            startGoogleSignIn()
+        case "close":
+            break
+        default:
+            break
+        }
+    }
+}
+
+// MARK: - ASWebAuthenticationPresentationContextProviding
+
+extension WebViewController: ASWebAuthenticationPresentationContextProviding {
+
+    func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
+        return view.window ?? UIWindow()
     }
 }
 

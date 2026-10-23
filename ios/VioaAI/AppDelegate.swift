@@ -6,6 +6,11 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
 
     var window: UIWindow?
 
+    /// Fallback when iOS launches the app through the `vioaai://` deep link
+    /// instead of returning into the authentication session.
+    static var pendingAuthCode: String?
+    static let authCodeNotification = Notification.Name("vioa.nativeAuthCode")
+
     func application(
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
@@ -19,6 +24,31 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         window.makeKeyAndVisible()
         self.window = window
 
+        if let url = launchOptions?[.url] as? URL {
+            _ = handleAuthURL(url)
+        }
+
+        return true
+    }
+
+    func application(
+        _ app: UIApplication,
+        open url: URL,
+        options: [UIApplication.OpenURLOptionsKey: Any] = [:]
+    ) -> Bool {
+        return handleAuthURL(url)
+    }
+
+    @discardableResult
+    private func handleAuthURL(_ url: URL) -> Bool {
+        guard url.scheme?.lowercased() == "vioaai" else { return false }
+        guard
+            let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+            let code = components.queryItems?.first(where: { $0.name == "code" })?.value
+        else { return false }
+
+        AppDelegate.pendingAuthCode = code
+        NotificationCenter.default.post(name: AppDelegate.authCodeNotification, object: code)
         return true
     }
 
