@@ -1,6 +1,5 @@
 import UIKit
 import WebKit
-import UniformTypeIdentifiers
 
 /// The app's single screen: a full-screen WKWebView pointed at vioa.site.
 ///
@@ -42,7 +41,6 @@ final class WebViewController: UIViewController {
     private var progressObservation: NSKeyValueObservation?
     private var popup: PopupWebViewController?
     private var downloadDestinations: [ObjectIdentifier: URL] = [:]
-    private var openPanelCompletion: (([URL]?) -> Void)?
     private var didCheckForUpdates = false
 
     // MARK: - Lifecycle
@@ -496,19 +494,6 @@ extension WebViewController: WKUIDelegate {
 
     func webView(
         _ webView: WKWebView,
-        runOpenPanelWith parameters: WKOpenPanelParameters,
-        initiatedByFrame frame: WKFrameInfo,
-        completionHandler: @escaping ([URL]?) -> Void
-    ) {
-        openPanelCompletion = completionHandler
-        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.item], asCopy: true)
-        picker.allowsMultipleSelection = parameters.allowsMultipleSelection
-        picker.delegate = self
-        present(picker, animated: true)
-    }
-
-    func webView(
-        _ webView: WKWebView,
         requestMediaCapturePermissionFor origin: WKSecurityOrigin,
         initiatedByFrame frame: WKFrameInfo,
         type: WKMediaCaptureType,
@@ -557,20 +542,5 @@ extension WebViewController: WKDownloadDelegate {
         )
         alert.addAction(UIAlertAction(title: "OK", style: .cancel))
         present(alert, animated: true)
-    }
-}
-
-// MARK: - UIDocumentPickerDelegate
-
-extension WebViewController: UIDocumentPickerDelegate {
-
-    func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
-        openPanelCompletion?(urls)
-        openPanelCompletion = nil
-    }
-
-    func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
-        openPanelCompletion?(nil)
-        openPanelCompletion = nil
     }
 }
