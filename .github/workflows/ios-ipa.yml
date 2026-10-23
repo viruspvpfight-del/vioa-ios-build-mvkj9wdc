@@ -1,0 +1,58 @@
+name: Build iOS IPA (unsigned)
+
+# Builds a real IPA on GitHub's macOS runners. No Mac needed locally:
+# run it from the Actions tab (or via the publish script), then download the
+# "vioa-ai-ipa" artifact and sign it with Sideloadly using your Apple ID.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Build unsigned IPA
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project ios/VioaAI.xcodeproj \
+            -scheme VioaAI \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath ios/build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+          APP="ios/build/Build/Products/Release-iphoneos/VioaAI.app"
+          test -d "$APP"
+
+          rm -rf ios/build/Payload
+          mkdir -p ios/build/Payload
+          cp -R "$APP" ios/build/Payload/
+          rm -f ios/vioa-ai.ipa
+          ( cd ios/build && zip -qry ../vioa-ai.ipa Payload )
+
+          unzip -l ios/vioa-ai.ipa | grep 'Payload/VioaAI.app/VioaAI'
+          unzip -l ios/vioa-ai.ipa | grep 'Payload/VioaAI.app/Info.plist'
+          shasum -a 256 ios/vioa-ai.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: vioa-ai-ipa
+          path: ios/vioa-ai.ipa
+          if-no-files-found: error
+          retention-days: 7
